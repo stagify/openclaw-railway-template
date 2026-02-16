@@ -109,6 +109,12 @@ function isConfigured() {
 let gatewayProc = null;
 let gatewayStarting = null;
 
+// Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
+let lastGatewayError = null;
+let lastGatewayExit = null;
+let lastDoctorOutput = null;
+let lastDoctorAt = null;
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -161,6 +167,7 @@ async function startGateway() {
 
   if (syncResult.code !== 0) {
     console.error(`[gateway] ⚠️  WARNING: Token sync failed with code ${syncResult.code}`);
+    throw new Error(`Token sync failed: ${syncResult.output}`);
   }
 
   // Verify sync succeeded
@@ -216,14 +223,33 @@ async function startGateway() {
   console.log(`[gateway] config path: ${configPath()}`);
 
   gatewayProc.on("error", (err) => {
-    console.error(`[gateway] spawn error: ${String(err)}`);
+    const msg = `[gateway] spawn error: ${String(err)}`;
+    console.error(msg);
+    lastGatewayError = msg;
     gatewayProc = null;
   });
 
   gatewayProc.on("exit", (code, signal) => {
-    console.error(`[gateway] exited code=${code} signal=${signal}`);
+    const msg = `[gateway] exited code=${code} signal=${signal}`;
+    console.error(msg);
+    lastGatewayExit = { code, signal, at: new Date().toISOString() };
     gatewayProc = null;
   });
+}
+
+async function runDoctorBestEffort() {
+  // Avoid spamming `openclaw doctor` in a crash loop.
+  const now = Date.now();
+  if (lastDoctorAt && now - lastDoctorAt < 5 * 60 * 1000) return;
+  lastDoctorAt = now;
+
+  try {
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["doctor"]));
+    const out = redactSecrets(r.output || "");
+    lastDoctorOutput = out.length > 50_000 ? out.slice(0, 50_000) + "\n... (truncated)\n" : out;
+  } catch (err) {
+    lastDoctorOutput = `doctor failed: ${String(err)}`;
+  }
 }
 
 async function ensureGatewayRunning() {
@@ -231,10 +257,19 @@ async function ensureGatewayRunning() {
   if (gatewayProc) return { ok: true };
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
-      await startGateway();
-      const ready = await waitForGatewayReady({ timeoutMs: 20_000 });
-      if (!ready) {
-        throw new Error("Gateway did not become ready in time");
+      try {
+        lastGatewayError = null;
+        await startGateway();
+        const ready = await waitForGatewayReady({ timeoutMs: 20_000 });
+        if (!ready) {
+          throw new Error("Gateway did not become ready in time");
+        }
+      } catch (err) {
+        const msg = `[gateway] start failure: ${String(err)}`;
+        lastGatewayError = msg;
+        // Collect extra diagnostics to help users file issues.
+        await runDoctorBestEffort();
+        throw err;
       }
     })().finally(() => {
       gatewayStarting = null;
@@ -300,12 +335,64 @@ function requireSetupAuth(req, res, next) {
   return next();
 }
 
+async function probeGateway() {
+  // Don't assume HTTP — the gateway primarily speaks WebSocket.
+  // A simple TCP connect check is enough for "is it up".
+  const net = await import("node:net");
+
+  return await new Promise((resolve) => {
+    const sock = net.createConnection({
+      host: INTERNAL_GATEWAY_HOST,
+      port: INTERNAL_GATEWAY_PORT,
+      timeout: 750,
+    });
+
+    const done = (ok) => {
+      try { sock.destroy(); } catch {}
+      resolve(ok);
+    };
+
+    sock.on("connect", () => done(true));
+    sock.on("timeout", () => done(false));
+    sock.on("error", () => done(false));
+  });
+}
+
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
 // Minimal health endpoint for Railway.
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
+
+// Public health endpoint (no auth) so Railway can probe without /setup.
+// Keep this free of secrets.
+app.get("/healthz", async (_req, res) => {
+  let gatewayReachable = false;
+  if (isConfigured()) {
+    try {
+      gatewayReachable = await probeGateway();
+    } catch {
+      gatewayReachable = false;
+    }
+  }
+
+  res.json({
+    ok: true,
+    wrapper: {
+      configured: isConfigured(),
+      stateDir: STATE_DIR,
+      workspaceDir: WORKSPACE_DIR,
+    },
+    gateway: {
+      target: GATEWAY_TARGET,
+      reachable: gatewayReachable,
+      lastError: lastGatewayError,
+      lastExit: lastGatewayExit,
+      lastDoctorAt,
+    },
+  });
+});
 
 // Serve static files for setup wizard
 app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
@@ -768,6 +855,18 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   }
 });
 
+function redactSecrets(text) {
+  if (!text) return text;
+  // Very small best-effort redaction. (Config paths/values may still contain secrets.)
+  return String(text)
+    .replace(/(sk-[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
+    .replace(/(gho_[A-Za-z0-9_]{10,})/g, "[REDACTED]")
+    .replace(/(xox[baprs]-[A-Za-z0-9-]{10,})/g, "[REDACTED]")
+    // Telegram bot tokens look like: 123456:ABCDEF...
+    .replace(/(\d{5,}:[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
+    .replace(/(AA[A-Za-z0-9_-]{10,}:\S{10,})/g, "[REDACTED]");
+}
+
 app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
   const v = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
   const help = await runCmd(
@@ -920,10 +1019,30 @@ app.use(async (req, res) => {
 });
 
 // Create HTTP server from Express app
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, async () => {
   console.log(`[wrapper] listening on port ${PORT}`);
   console.log(`[wrapper] setup wizard: http://localhost:${PORT}/setup`);
   console.log(`[wrapper] configured: ${isConfigured()}`);
+
+  // Harden state dir for OpenClaw and avoid missing credentials dir on fresh volumes.
+  try {
+    fs.mkdirSync(path.join(STATE_DIR, "credentials"), { recursive: true });
+  } catch {}
+  try {
+    fs.chmodSync(STATE_DIR, 0o700);
+  } catch {}
+
+  // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
+  // work even if nobody visits the web UI.
+  if (isConfigured()) {
+    console.log("[wrapper] config detected; starting gateway...");
+    try {
+      await ensureGatewayRunning();
+      console.log("[wrapper] gateway ready");
+    } catch (err) {
+      console.error(`[wrapper] gateway failed to start at boot: ${String(err)}`);
+    }
+  }
 });
 
 // Handle WebSocket upgrades
