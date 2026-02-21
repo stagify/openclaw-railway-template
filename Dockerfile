@@ -80,29 +80,12 @@ RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
-    build-essential \
-    gcc \
-    g++ \
-    make \
-    procps \
-    file \
     git \
+    gosu \
+    procps \
     python3 \
-    pkg-config \
-    sudo \
+    build-essential \
   && rm -rf /var/lib/apt/lists/*
-
-# Install Homebrew (must run as non-root user)
-# Create a user for Homebrew installation, install it, then make it accessible to all users
-RUN useradd -m -s /bin/bash linuxbrew \
-  && echo 'linuxbrew ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
-
-USER linuxbrew
-RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-USER root
-RUN chown -R root:root /home/linuxbrew/.linuxbrew
-ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
 
 WORKDIR /app
 
@@ -114,12 +97,32 @@ RUN pnpm install --prod --frozen-lockfile && pnpm store prune
 # Copy built openclaw
 COPY --from=openclaw-build /openclaw /openclaw
 
-# Provide a openclaw executable
+# Provide an openclaw executable
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"' > /usr/local/bin/openclaw \
   && chmod +x /usr/local/bin/openclaw
 
 COPY src ./src
+COPY entrypoint.sh ./entrypoint.sh
+
+# Create openclaw user, set up directories, install Homebrew as that user
+RUN useradd -m -s /bin/bash openclaw \
+  && chown -R openclaw:openclaw /app \
+  && mkdir -p /data && chown openclaw:openclaw /data \
+  && mkdir -p /home/linuxbrew/.linuxbrew && chown -R openclaw:openclaw /home/linuxbrew
+
+USER openclaw
+RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
+ENV HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
+ENV HOMEBREW_CELLAR="/home/linuxbrew/.linuxbrew/Cellar"
+ENV HOMEBREW_REPOSITORY="/home/linuxbrew/.linuxbrew/Homebrew"
 
 ENV PORT=8080
 EXPOSE 8080
-CMD ["node", "src/server.js"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD curl -f http://localhost:8080/setup/healthz || exit 1
+
+USER root
+ENTRYPOINT ["./entrypoint.sh"]
